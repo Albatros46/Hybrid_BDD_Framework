@@ -1,0 +1,157 @@
+name: Hybrid BDD Tests
+
+# Two real applications are built from their own repositories at fixed versions and started here:
+# Musify (Spotify Clone) and Netflix Clone, each with its own PostgreSQL, Netflix with Mailpit.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: '0 5 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  MUSIFY_REPOSITORY: Albatros46/Spotify_Clone
+  MUSIFY_VERSION: v1.1.0
+  NETFLIX_REPOSITORY: Albatros46/Netflix_Clone
+  NETFLIX_VERSION: 002de062d238c8a3e3854b67f0c851c9ad6560b3
+
+jobs:
+  hybrid:
+    name: UI + API + e-mail scenarios (Musify, Netflix)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      musify-db:
+        image: postgres:18.4-alpine
+        env:
+          POSTGRES_DB: spotify_music
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: ci-only-password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s --health-timeout 5s --health-retries 12
+      netflix-db:
+        image: postgres:16.15-alpine
+        env:
+          POSTGRES_DB: netflix_clone
+          POSTGRES_USER: netflix
+          POSTGRES_PASSWORD: ci-only-password
+        ports:
+          - 5433:5432
+        options: >-
+          --health-cmd "pg_isready -U netflix -d netflix_clone"
+          --health-interval 5s --health-timeout 5s --health-retries 12
+      mailpit:
+        image: axllent/mailpit:v1.31.6
+        ports:
+          - 8027:8025
+          - 1027:1025
+    steps:
+      - name: Checkout the tests
+        uses: actions/checkout@v7
+
+      - name: Checkout Musify (${{ env.MUSIFY_REPOSITORY }} @ ${{ env.MUSIFY_VERSION }})
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ env.MUSIFY_REPOSITORY }}
+          ref: ${{ env.MUSIFY_VERSION }}
+          path: apps/musify
+
+      - name: Checkout Netflix Clone (${{ env.NETFLIX_REPOSITORY }} @ ${{ env.NETFLIX_VERSION }})
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ env.NETFLIX_REPOSITORY }}
+          ref: ${{ env.NETFLIX_VERSION }}
+          path: apps/netflix
+
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+          cache-dependency-path: '**/pom.xml'
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+
+      - name: Generate secrets for this run (masked)
+        run: |
+          for name in MUSIFY_JWT_SECRET NETFLIX_JWT_SECRET NETFLIX_ADMIN_PASSWORD; do
+            value=$(openssl rand -hex 32)
+            echo "::add-mask::$value"
+            echo "$name=$value" >> "$GITHUB_ENV"
+          done
+
+      - name: Build the two APIs
+        run: |
+          (cd apps/musify && ./mvnw -B -q -DskipTests package)
+          (cd apps/netflix/com.NetflixClone && chmod +x mvnw && ./mvnw -B -q -DskipTests package)
+
+      - name: Start the two APIs
+        run: |
+          mkdir -p logs
+          (cd apps/musify && DB_PASSWORD=ci-only-password JWT_SECRET="$MUSIFY_JWT_SECRET" \
+            nohup java -jar "$(ls target/Spotify_Clone-*.jar | grep -v original)" > ../../logs/musify-api.log 2>&1 &)
+          (cd apps/netflix/com.NetflixClone && \
+            DB_URL=jdbc:postgresql://localhost:5433/netflix_clone DB_USERNAME=netflix DB_PASSWORD=ci-only-password \
+            JWT_SECRET="$NETFLIX_JWT_SECRET" ADMIN_PASSWORD="$NETFLIX_ADMIN_PASSWORD" \
+            MAIL_HOST=localhost MAIL_PORT=1027 FRONTEND_URL=http://localhost:5175 \
+            nohup java -jar target/app.jar > ../../../logs/netflix-api.log 2>&1 &)
+
+      - name: Build and serve the two UIs (vite preview proxies /api to the APIs)
+        run: |
+          (cd apps/musify/frontend && npm ci --no-audit --no-fund && npm run build)
+          (cd apps/netflix/frontend && npm ci --no-audit --no-fund && npm run build)
+          (cd apps/musify/frontend && nohup npx vite preview --port 5173 --strictPort > ../../../logs/musify-ui.log 2>&1 &)
+          (cd apps/netflix/frontend && nohup npx vite preview --port 5175 --strictPort > ../../../logs/netflix-ui.log 2>&1 &)
+
+      - name: Wait until everything answers
+        run: |
+          wait_for() {
+            for i in $(seq 1 90); do
+              code=$(curl -s -o /dev/null -w '%{http_code}' "$1" || true)
+              if [ "$code" = "$2" ]; then echo "$1 is up after $((i * 2)) s"; return 0; fi
+              sleep 2
+            done
+            echo "$1 did not answer $2"; tail -50 logs/*.log; return 1
+          }
+          wait_for http://localhost:8042/api/users/me 401
+          wait_for http://localhost:8086/api/auth/current-user 401
+          wait_for http://localhost:5173/api/users/me 401
+          wait_for http://localhost:5175/api/auth/current-user 401
+          wait_for http://localhost:8027/api/v1/messages 200
+
+      - name: Run the scenarios (4 in parallel, headless Chrome)
+        run: mvn -B test -Denv=ci -Dthreads=4
+
+      - name: Known bugs are still open (these scenarios are expected to fail)
+        if: always()
+        run: |
+          if mvn -B -q test -Denv=ci -Dcucumber.filter.tags=@known-bug -Dcucumber.plugin=summary > known-bugs.log 2>&1; then
+            echo "::warning::The @known-bug scenarios pass now - the defects seem fixed, remove the tag"
+          else
+            echo "Known bugs still reproduce:"; grep -E "Tests run:|expected|but was" known-bugs.log | head -10
+          fi
+
+      - name: Upload reports and logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: hybrid-report
+          path: |
+            target/cucumber-report.html
+            target/cucumber.json
+            logs/
+          if-no-files-found: ignore
+          retention-days: 14
